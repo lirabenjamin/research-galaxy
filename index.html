@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Research Galaxy</title>
+<script src="galaxy_text.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Space+Grotesk:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #03050c; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  body.idle canvas { cursor: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* Research galaxy — presenter controls:
+   → / Space / PageDown / click = next   ← / PageUp = back   Home = reset
+   A = autoplay loop (4 s/step)   H = hide step indicator   F = fullscreen */
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const HEAD = '"Space Grotesk", "Inter", system-ui, sans-serif';
+  const BODY = '"Inter", system-ui, -apple-system, sans-serif';
+
+  // ---------- content (all copy lives in galaxy_text.js) ----------
+  const TXT = window.GALAXY_TEXT;
+  const LOOK = [ // visual settings per system, same order as TXT.systems
+    { color: [244, 114, 182], pos: [470, -150], lab: { dx: 0, dy: -34, align: 'center', anchor: 'bottom' } },
+    { color: [45, 212, 191], pos: [-300, -40], lab: { dx: -40, dy: -4, align: 'right', anchor: 'mid' } },
+    { color: [167, 139, 250], pos: [-170, -235], lab: { dx: -40, dy: -4, align: 'right', anchor: 'mid' } },
+    { color: [96, 165, 250], pos: [230, 245], lab: { dx: 40, dy: -4, align: 'left', anchor: 'mid' } },
+  ];
+  const SYS = TXT.systems.map((t, i) => ({ ...LOOK[i], name: t.name, role: t.role, q: t.question, projects: t.projects }));
+  const SPINE = [1, 2, 0, 3]; // system order of the spine words: Tool, Advisor, Other, Collaborator
+
+  // ---------- camera steps ----------
+  const ZIN = 7.2;
+  const OV = { x: 80, y: 14, z: 1.18 };
+  const zoomCam = i => ({ x: SYS[i].pos[0], y: SYS[i].pos[1] - 110 / ZIN, z: ZIN });
+  const STEPS = [
+    { cam: { x: 40, y: 0, z: 0.3 }, focus: -1, title: 0, labels: 0, spine: 0 },
+    { cam: OV, focus: -1, title: 1, labels: 1, spine: 0 },
+    { cam: zoomCam(0), focus: 0, title: 0, labels: 0, spine: 0 },
+    { cam: OV, focus: -1, title: 1, labels: 1, spine: 0 },
+    { cam: zoomCam(1), focus: 1, title: 0, labels: 0, spine: 0 },
+    { cam: OV, focus: -1, title: 1, labels: 1, spine: 0 },
+    { cam: zoomCam(2), focus: 2, title: 0, labels: 0, spine: 0 },
+    { cam: OV, focus: -1, title: 1, labels: 1, spine: 0 },
+    { cam: zoomCam(3), focus: 3, title: 0, labels: 0, spine: 0 },
+    { cam: OV, focus: -1, title: 1, labels: 1, spine: 1 },
+  ];
+
+  // ---------- seeded random ----------
+  let seed = 7;
+  const rnd = () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  const gauss = () => { let u = 0, v = 0; while (!u) u = rnd(); while (!v) v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+  const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+  const ease = p => p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+  const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+  const mix = (a, b, t) => [0, 1, 2].map(k => Math.round(a[k] + (b[k] - a[k]) * t));
+
+  // ---------- glow sprites ----------
+  function sprite(c, hard = 0) {
+    const s = document.createElement('canvas'); s.width = s.height = 128;
+    const g = s.getContext('2d'), gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+    gr.addColorStop(0, rgba(c, 1)); gr.addColorStop(0.12 + hard, rgba(c, 0.55));
+    gr.addColorStop(0.4, rgba(c, 0.12)); gr.addColorStop(1, rgba(c, 0));
+    g.fillStyle = gr; g.fillRect(0, 0, 128, 128); return s;
+  }
+  const WARM = [255, 196, 120];
+  const sprWarm = sprite(WARM), sprWhite = sprite([220, 228, 255]);
+  SYS.forEach(s => { s.spr = sprite(s.color); s.light = mix(s.color, [255, 255, 255], 0.45); });
+
+  // ---------- galaxy dust (world space) ----------
+  const DUST_COLORS = [[205, 218, 255], [170, 190, 255], [255, 214, 170], ...SYS.map(s => mix(s.color, [220, 225, 255], 0.5))];
+  const dust = [];
+  for (let i = 0; i < 3400; i++) {
+    let r, a, ci;
+    if (i < 550) { r = Math.abs(gauss()) * 55; a = rnd() * Math.PI * 2; ci = rnd() < 0.6 ? 2 : 0; }
+    else {
+      const arm = i % 2;
+      r = 45 + Math.pow(rnd(), 1.35) * 560;
+      a = arm * Math.PI + Math.log(r / 40) * 2.0 + gauss() * (0.17 + 10 / r);
+      r += gauss() * 12;
+      const u = rnd(); ci = u < 0.55 ? 0 : u < 0.8 ? 1 : 3 + Math.floor(rnd() * 4);
+    }
+    dust.push({ r, a, ci, al: 0.25 + rnd() * 0.55, s: 0.7 + rnd() * 1.1, ph: rnd() * 6.28 });
+  }
+  const neb = [];
+  for (let i = 0; i < 70; i++) {
+    const arm = i % 2, r = 60 + rnd() * 470, a = arm * Math.PI + Math.log(r / 40) * 2.0 + gauss() * 0.25;
+    const tint = rnd() < 0.5 ? sprWhite : SYS[Math.floor(rnd() * 4)].spr;
+    neb.push({ r, a, size: 50 + rnd() * 90, al: 0.035 + rnd() * 0.05, spr: tint });
+  }
+
+  // ---------- background starfield (screen space, parallax layers) ----------
+  const bg = [];
+  [[260, 0.15], [170, 0.35], [80, 0.7]].forEach(([n, d]) => {
+    for (let i = 0; i < n; i++) bg.push({ x: rnd(), y: rnd(), d, s: 0.5 + rnd() * (0.6 + d), ph: rnd() * 6.28, w: 0.6 + rnd() * 2.2, al: 0.25 + rnd() * 0.6 });
+  });
+
+  // ---------- planets ----------
+  SYS.forEach((s, si) => {
+    const spacing = Math.min(8, 26 / Math.max(1, s.projects.length - 1));
+    s.planets = s.projects.map(({ name: main, sub = '', badge = '', url = '' }, i, arr) => ({
+      main, sub, badge, url, orbit: 15 + i * spacing, size: 1.4 + rnd() * 0.9,
+      a0: (i / arr.length) * Math.PI * 2 + si * 0.9 + 0.4, period: 90 + i * 35 + rnd() * 20,
+    }));
+  });
+
+  // ---------- foundations: faint outer ring of tiny stars (world space) ----------
+  const FRING = { cx: 80, cy: 14, rx: 700, ry: 424 }; // centred on the overview camera so the ring frames the slide
+  const ring = [];
+  if (TXT.showFoundations) for (let i = 0; i < 340; i++) {
+    ring.push({ a: rnd() * Math.PI * 2, dr: 1 + gauss() * 0.02, al: 0.3 + rnd() * 0.4, s: 1 + rnd() * 1.2, ph: rnd() * 6.28 });
+  }
+
+  // ---------- state ----------
+  let W = 0, H = 0, dpr = 1, S = 1;
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 3);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    S = Math.min(W / 1600, H / 900);
+  }
+  window.addEventListener('resize', resize); resize();
+
+  let step = 0;
+  let tr = { fromCam: { ...STEPS[0].cam }, toCam: { ...STEPS[0].cam }, from: 0, to: 0, t0: 0, dur: 1 };
+  let cam = { ...STEPS[0].cam };
+  let auto = false, lastAuto = 0, hud = true;
+
+  function camAt(A, B, p) {
+    const e = ease(p), la = Math.log(A.z), lb = Math.log(B.z);
+    const z = Math.exp(la + (lb - la) * e);
+    const w = Math.abs(lb - la) < 1e-3 ? e : (1 / z - 1 / A.z) / (1 / B.z - 1 / A.z);
+    return { x: A.x + (B.x - A.x) * w, y: A.y + (B.y - A.y) * w, z };
+  }
+  function go(n, instant = false) {
+    n = ((n % STEPS.length) + STEPS.length) % STEPS.length;
+    const now = performance.now();
+    const B = STEPS[n].cam;
+    const dur = clamp(1300 + 330 * Math.abs(Math.log(B.z / cam.z)) + 0.6 * Math.hypot(B.x - cam.x, B.y - cam.y), 1500, 2500);
+    tr = { fromCam: { ...cam }, toCam: { ...B }, from: instant ? n : step, to: n, t0: now, dur: instant ? 1 : dur };
+    if (instant) cam = { ...B };
+    step = n; lastAuto = now;
+  }
+  const next = () => go(step + 1), prev = () => go(step - 1);
+
+  window.addEventListener('keydown', e => {
+    const k = e.key;
+    if (k === 'ArrowRight' || k === ' ' || k === 'PageDown' || k === 'Enter') { e.preventDefault(); next(); }
+    else if (k === 'ArrowLeft' || k === 'PageUp' || k === 'Backspace') { e.preventDefault(); prev(); }
+    else if (k === 'Home') { e.preventDefault(); auto = false; go(0, true); }
+    else if (k === 'a' || k === 'A') { auto = !auto; lastAuto = performance.now(); }
+    else if (k === 'h' || k === 'H') hud = !hud;
+    else if (k === 'f' || k === 'F') { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.(); }
+  });
+  // project labels with a url are links: clicking one opens it and does not advance
+  let hits = [];
+  const hitAt = (x, y) => hits.find(h => x >= h.x0 && x <= h.x1 && y >= h.y0 && y <= h.y1);
+  canvas.addEventListener('click', e => {
+    const h = hitAt(e.clientX, e.clientY);
+    if (h) { window.open(h.url, '_blank', 'noopener'); return; }
+    next();
+  });
+  canvas.addEventListener('mousemove', e => { canvas.style.cursor = hitAt(e.clientX, e.clientY) ? 'pointer' : ''; });
+  let idleT; window.addEventListener('mousemove', () => { document.body.classList.remove('idle'); clearTimeout(idleT); idleT = setTimeout(() => document.body.classList.add('idle'), 2000); });
+
+  // ---------- helpers ----------
+  const toScreen = (x, y) => [(x - cam.x) * cam.z * S + W / 2, (y - cam.y) * cam.z * S + H / 2];
+  function fade(a, b, p) {
+    if (a && b) return 1;
+    const out = a ? 1 - clamp(p / 0.35) : 0, inn = b ? clamp((p - 0.6) / 0.4) : 0;
+    return ease(Math.max(out, inn));
+  }
+  function text(str, x, y, { size, font = BODY, weight = 400, color = '#fff', align = 'left', spacing = 0, alpha = 1, base = 'alphabetic' }) {
+    if (alpha <= 0.005) return 0;
+    ctx.font = `${weight} ${size * S}px ${font}`;
+    if ('letterSpacing' in ctx) ctx.letterSpacing = `${spacing * S}px`;
+    ctx.textAlign = align; ctx.textBaseline = base;
+    ctx.globalAlpha = alpha; ctx.fillStyle = color;
+    ctx.shadowColor = 'rgba(2,4,12,0.9)'; ctx.shadowBlur = 14 * S;
+    ctx.fillText(str, x, y);
+    ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+    const w = ctx.measureText(str).width;
+    if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+    return w;
+  }
+
+  // Fit text into maxW: try 1..maxLines lines at full size, then shrink (to 72%), then wrap freely.
+  function setFont({ size, font = BODY, weight = 400, spacing = 0 }) {
+    ctx.font = `${weight} ${size * S}px ${font}`;
+    if ('letterSpacing' in ctx) ctx.letterSpacing = `${spacing * S}px`;
+  }
+  function wrap(str, maxW) {
+    const words = String(str).split(/\s+/).filter(Boolean), lines = [];
+    let cur = '';
+    for (const w of words) {
+      const t = cur ? cur + ' ' + w : w;
+      if (cur && ctx.measureText(t).width > maxW) { lines.push(cur); cur = w; } else cur = t;
+    }
+    if (cur) lines.push(cur);
+    return lines.length ? lines : [''];
+  }
+  function fit(str, o, maxW, maxLines = 1) {
+    let lines, size = o.size;
+    for (let f = 1; f >= 0.72; f -= 0.04) {
+      size = o.size * f; setFont({ ...o, size }); lines = wrap(str, maxW);
+      if (lines.length <= maxLines && lines.every(l => ctx.measureText(l).width <= maxW)) break;
+    }
+    if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+    const lh = size * (o.lh || 1.22) * S;
+    return { o: { ...o, size }, lines, lh, h: lines.length * lh };
+  }
+  // Draw a fitted block with its top edge at y.
+  function block(b, x, y, alpha) {
+    b.lines.forEach((l, j) => text(l, x, y + j * b.lh, { ...b.o, base: 'top', alpha }));
+    return b.h;
+  }
+
+  // ---------- frame ----------
+  function frame(now) {
+    const t = now / 1000;
+    if (auto && now - lastAuto > 4000) next();
+    const p = clamp((now - tr.t0) / tr.dur);
+    cam = camAt(tr.fromCam, tr.toCam, p);
+    const F = STEPS[tr.from], T = STEPS[tr.to];
+    const aTitle = fade(F.title, T.title, p), aLab = fade(F.labels, T.labels, p), aSpine = fade(F.spine, T.spine, p);
+    const aFocus = SYS.map((_, i) => fade(F.focus === i, T.focus === i, p));
+    const zRel = Math.log(cam.z / OV.z);
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    const bgGrad = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.max(W, H) * 0.75);
+    bgGrad.addColorStop(0, '#0a1024'); bgGrad.addColorStop(1, '#02030a');
+    ctx.fillStyle = bgGrad; ctx.fillRect(0, 0, W, H);
+
+    // background stars with parallax + zoom drift
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = '#dfe7ff';
+    for (const s of bg) {
+      const zs = Math.exp(zRel * s.d * 0.18);
+      let x = W / 2 + ((s.x - cam.x * s.d * 0.00025) % 1 + 1.5) % 1 * W * zs - W * zs / 2;
+      let y = H / 2 + ((s.y - cam.y * s.d * 0.00025) % 1 + 1.5) % 1 * H * zs - H * zs / 2;
+      x = ((x % W) + W) % W; y = ((y % H) + H) % H;
+      ctx.globalAlpha = s.al * (0.65 + 0.35 * Math.sin(t * s.w + s.ph));
+      const r = s.s * Math.min(S * 1.3, 1.6);
+      ctx.fillRect(x - r / 2, y - r / 2, r, r);
+    }
+
+    // galaxy
+    const rot = t * 0.012, k = cam.z * S;
+    const dustFade = clamp(1.15 - (cam.z - 2) / 9, 0.35, 1);
+    for (const n of neb) {
+      const a = n.a + rot, [x, y] = toScreen(n.r * Math.cos(a), n.r * Math.sin(a) * 0.72);
+      const sz = n.size * k;
+      if (x + sz < 0 || x - sz > W || y + sz < 0 || y - sz > H) continue;
+      ctx.globalAlpha = n.al * dustFade; ctx.drawImage(n.spr, x - sz, y - sz, sz * 2, sz * 2);
+    }
+    const ds = clamp(k * 0.9, 0.6, 2.6);
+    for (let ci = 0; ci < DUST_COLORS.length; ci++) {
+      ctx.fillStyle = rgba(DUST_COLORS[ci], 1);
+      for (const d of dust) {
+        if (d.ci !== ci) continue;
+        const a = d.a + rot, [x, y] = toScreen(d.r * Math.cos(a), d.r * Math.sin(a) * 0.72);
+        if (x < -4 || x > W + 4 || y < -4 || y > H + 4) continue;
+        ctx.globalAlpha = d.al * dustFade * (0.75 + 0.25 * Math.sin(t * 1.3 + d.ph));
+        const r = ds * d.s; ctx.fillRect(x - r / 2, y - r / 2, r, r);
+      }
+    }
+
+    // foundations ring (faint)
+    if (ring.length) {
+      ctx.fillStyle = '#c9d3f0';
+      for (const r0 of ring) {
+        const a = r0.a, [x, y] = toScreen(FRING.cx + FRING.rx * r0.dr * Math.cos(a), FRING.cy + FRING.ry * r0.dr * Math.sin(a));
+        if (x < -4 || x > W + 4 || y < -4 || y > H + 4) continue;
+        ctx.globalAlpha = r0.al * (0.7 + 0.3 * Math.sin(t * 0.9 + r0.ph));
+        const r = Math.max(r0.s * Math.min(k, 2), 0.8); ctx.fillRect(x - r / 2, y - r / 2, r, r);
+      }
+    }
+
+    // core glow
+    const [hx, hy] = toScreen(0, 0);
+    const pulse = 1 + 0.04 * Math.sin(t * 1.4);
+    let cs = 95 * k * pulse; ctx.globalAlpha = 0.55; ctx.drawImage(sprWarm, hx - cs, hy - cs, cs * 2, cs * 2);
+    cs = 30 * k * pulse; ctx.globalAlpha = 0.95; ctx.drawImage(sprWarm, hx - cs, hy - cs, cs * 2, cs * 2);
+    cs = 9 * k; ctx.globalAlpha = 0.9; ctx.drawImage(sprite.white, hx - cs, hy - cs, cs * 2, cs * 2);
+
+    // filaments core → systems (overview)
+    ctx.globalCompositeOperation = 'source-over';
+    if (aLab > 0.01) {
+      ctx.lineWidth = 1.2 * S;
+      SYS.forEach(s => {
+        const [sx, sy] = toScreen(...s.pos);
+        const g = ctx.createLinearGradient(hx, hy, sx, sy);
+        g.addColorStop(0, rgba(WARM, 0.0)); g.addColorStop(0.3, rgba(WARM, 0.22)); g.addColorStop(1, rgba(s.color, 0.28));
+        ctx.globalAlpha = aLab; ctx.strokeStyle = g;
+        const L = Math.hypot(sx - hx, sy - hy) || 1, o = 70 * S / L;
+        ctx.beginPath(); ctx.moveTo(hx + (sx - hx) * o, hy + (sy - hy) * o); ctx.lineTo(sx, sy); ctx.stroke();
+      });
+      ctx.globalAlpha = 1;
+    }
+
+    // spine: Tool → Advisor → Other → Collaborator
+    if (aSpine > 0.01) {
+      ctx.save(); ctx.globalAlpha = 0.55 * aSpine; ctx.setLineDash([3 * S, 9 * S]); ctx.lineWidth = 1.6 * S; ctx.strokeStyle = '#e6ebff';
+      ctx.beginPath();
+      SPINE.forEach((si, j) => {
+        const [x, y] = toScreen(...SYS[si].pos);
+        if (!j) { ctx.moveTo(x, y); return; }
+        const [px, py] = toScreen(...SYS[SPINE[j - 1]].pos);
+        const mx = (px + x) / 2, my = (py + y) / 2, nx = -(y - py), ny = x - px, L = Math.hypot(nx, ny) || 1;
+        ctx.quadraticCurveTo(mx + nx / L * 60 * S, my + ny / L * 60 * S, x, y);
+      });
+      ctx.stroke(); ctx.restore();
+    }
+
+    // systems
+    ctx.globalCompositeOperation = 'lighter';
+    SYS.forEach((s, si) => {
+      const [sx, sy] = toScreen(...s.pos);
+      const big = 60 * k;
+      if (sx + big < -200 || sx - big > W + 200 || sy + big < -200 || sy - big > H + 200) { s.vis = false; return; }
+      s.vis = true;
+      ctx.globalAlpha = 0.75; let r = 30 * k; ctx.drawImage(s.spr, sx - r, sy - r, r * 2, r * 2);
+      ctx.globalAlpha = 1; r = Math.max(7 * k, 4); ctx.drawImage(s.spr, sx - r, sy - r, r * 2, r * 2);
+      r = Math.max(2.2 * k, 2.2); ctx.globalAlpha = 0.95; ctx.drawImage(sprite.white, sx - r, sy - r, r * 2, r * 2);
+      // orbits
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.lineWidth = Math.max(0.6, 1 * S);
+      s.planets.forEach(pl => {
+        ctx.strokeStyle = rgba(s.light, 0.10 + 0.12 * aFocus[si]);
+        ctx.beginPath(); ctx.arc(sx, sy, pl.orbit * k, 0, Math.PI * 2); ctx.stroke();
+      });
+      // planets
+      s.planets.forEach(pl => {
+        const a = pl.a0 + t * Math.PI * 2 / pl.period;
+        const px = sx + Math.cos(a) * pl.orbit * k, py = sy + Math.sin(a) * pl.orbit * k;
+        pl.sx = px; pl.sy = py;
+        const pr = Math.max(pl.size * k, 1.4);
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = 0.6; ctx.drawImage(s.spr, px - pr * 3, py - pr * 3, pr * 6, pr * 6);
+        ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+        const g = ctx.createRadialGradient(px - pr * 0.35, py - pr * 0.35, pr * 0.1, px, py, pr);
+        g.addColorStop(0, rgba(mix(s.light, [255, 255, 255], 0.5), 1)); g.addColorStop(1, rgba(mix(s.color, [10, 14, 30], 0.35), 1));
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(px, py, pr, 0, Math.PI * 2); ctx.fill();
+        pl.pr = pr;
+      });
+      ctx.globalCompositeOperation = 'lighter';
+    });
+    ctx.globalCompositeOperation = 'source-over';
+
+    // ---------- overview labels ----------
+    if (aLab > 0.01) {
+      SYS.forEach(s => {
+        const [sx, sy] = toScreen(...s.pos);
+        const nb = fit(s.name, { size: 27, font: HEAD, weight: 600, align: s.lab.align, lh: 1.15 }, 330 * S, 2);
+        const rb = fit(s.role.toUpperCase(), { size: 15, weight: 600, color: rgba(s.light, 1), align: s.lab.align, spacing: 2.4 }, 330 * S, 2);
+        const h = nb.h + 4 * S + rb.h, x = sx + s.lab.dx * S;
+        const y = s.lab.anchor === 'bottom' ? sy + s.lab.dy * S - h : sy + s.lab.dy * S - h / 2;
+        block(rb, x, y + nb.h + 4 * S, aLab); block(nb, x, y, aLab);
+      });
+      block(fit(TXT.core, { size: 15, weight: 600, color: rgba([255, 214, 160], 1), align: 'center', spacing: 3.5 }, 320 * S, 2), hx, hy + 40 * S, aLab);
+    }
+    if (aTitle > 0.01) {
+      block(fit(TXT.title, { size: 46, font: HEAD, weight: 600, align: 'center', lh: 1.1 }, 1400 * S, 1), W / 2, H / 2 - 405 * S, aTitle);
+    }
+    if (ring.length && aSpine > 0.01 && TXT.foundations) {
+      const [fx, fy] = toScreen(FRING.cx - FRING.rx * Math.cos(0.55), FRING.cy + FRING.ry * Math.sin(0.55));
+      text(TXT.foundations, fx + 18 * S, fy - 34 * S, { size: 15, weight: 500, color: '#aab3cc', spacing: 0.6, alpha: 0.85 * aSpine });
+    }
+    if (aSpine > 0.01) {
+      const parts = TXT.spine.map((w, j) => [w, SYS[SPINE[j % SPINE.length]].light]);
+      const arrow = '  →  ';
+      ctx.font = `500 ${24 * S}px ${BODY}`;
+      const total = parts.reduce((w, [s]) => w + ctx.measureText(s).width, 0) + ctx.measureText(arrow).width * (parts.length - 1);
+      const fs = 24 * Math.min(1, 1400 * S / total);
+      let x = W / 2 - total * fs / 48; const y = H / 2 + 400 * S;
+      parts.forEach(([s, c], j) => {
+        x += text(s, x, y, { size: fs, weight: 500, color: rgba(c, 1), alpha: aSpine });
+        if (j < parts.length - 1) x += text(arrow, x, y, { size: fs, weight: 300, color: '#8b93ad', alpha: aSpine });
+      });
+    }
+
+    // ---------- zoomed-in detail ----------
+    hits = [];
+    SYS.forEach((s, si) => {
+      const a = aFocus[si];
+      if (a < 0.01 || !s.vis) return;
+      const x0 = W / 2 - 700 * S, y0 = H / 2 - 450 * S;
+      const hw = 1400 * S;
+      let hy0 = y0 + 76 * S;
+      hy0 += block(fit(s.role.toUpperCase(), { size: 19, weight: 600, color: rgba(s.light, 1), spacing: 3.5 }, hw, 1), x0, hy0, a) + 8 * S;
+      hy0 += block(fit(s.name, { size: 58, font: HEAD, weight: 600, lh: 1.08 }, hw, 1), x0, hy0, a) + 10 * S;
+      hy0 += block(fit(s.q, { size: 28, weight: 300, color: '#cdd5ea', lh: 1.3 }, hw, 2), x0, hy0, a);
+      // planet labels in two columns outside the outermost orbit (balanced: left half by x goes left)
+      const [sx, sy] = toScreen(...s.pos);
+      const R = s.planets[s.planets.length - 1].orbit * k;
+      const cols = { L: [], R: [] };
+      [...s.planets].sort((u, v) => u.sx - v.sx).forEach((pl, j, arr) => cols[j < arr.length / 2 ? 'L' : 'R'].push(pl));
+      const gap = 22 * S, top = Math.max(H / 2 - 175 * S, hy0 + 30 * S), bot = H / 2 + 405 * S;
+      const PILL = { size: 14, weight: 600, spacing: 1.6 }, pillH = 25 * S, pillGap = 7 * S;
+      for (const side of ['L', 'R']) {
+        const arr = cols[side].sort((u, v) => u.sy - v.sy);
+        const lx = side === 'L' ? sx - R - 46 * S : sx + R + 46 * S;
+        const al = side === 'L' ? 'right' : 'left';
+        const maxW = Math.min(470 * S, side === 'L' ? lx - 30 * S : W - lx - 30 * S);
+        setFont({ size: 25, weight: 500 }); const arrowW = pl => pl.url ? ctx.measureText(' ↗').width : 0;
+        arr.forEach(pl => {
+          pl.mb = fit(pl.main, { size: 25, weight: 500, align: al, lh: 1.2 }, maxW - arrowW(pl) * 1.05, 2);
+          pl.sb = pl.sub ? fit(pl.sub, { size: 19, color: '#a7b0ca', align: al, lh: 1.25 }, maxW, 2) : null;
+          pl.ph = pl.badge ? pillH + pillGap : 0;
+          pl.lh = pl.ph + pl.mb.h + (pl.sb ? 3 * S + pl.sb.h : 0);
+        });
+        const lim = pl => [top + pl.lh / 2, Math.max(top + pl.lh / 2, bot - pl.lh / 2)];
+        arr.forEach(pl => pl.ly = clamp(pl.sy, ...lim(pl)));
+        for (let it = 0; it < 40; it++) {
+          for (let j = 1; j < arr.length; j++) {
+            const need = (arr[j - 1].lh + arr[j].lh) / 2 + gap, d = arr[j].ly - arr[j - 1].ly;
+            if (d < need) { const m = (need - d) / 2; arr[j - 1].ly -= m; arr[j].ly += m; }
+          }
+          arr.forEach(pl => pl.ly = clamp(pl.ly, ...lim(pl)));
+        }
+        const dir = side === 'L' ? -1 : 1; // text grows away from the star
+        arr.forEach(pl => {
+          const ex = lx - dir * 10 * S;
+          ctx.globalAlpha = 0.45 * a; ctx.strokeStyle = rgba(s.light, 1); ctx.lineWidth = 1 * S;
+          ctx.beginPath(); ctx.moveTo(pl.sx + dir * (pl.pr + 4 * S), pl.sy); ctx.lineTo(ex, pl.ly); ctx.stroke();
+          ctx.beginPath(); ctx.arc(ex, pl.ly, 2.5 * S, 0, Math.PI * 2); ctx.fillStyle = rgba(s.light, 1); ctx.fill();
+          ctx.globalAlpha = 1;
+          let ty = pl.ly - pl.lh / 2, wMax = 0;
+          const y0 = ty;
+          // badge pill
+          if (pl.badge) {
+            const lab = pl.badge.toUpperCase();
+            setFont(PILL); const pw = ctx.measureText(lab).width + 20 * S;
+            if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+            const px0 = side === 'L' ? lx - pw : lx;
+            const solid = /^published$/i.test(pl.badge), dim = /progress/i.test(pl.badge);
+            const pc = dim ? [176, 186, 212] : s.light;
+            ctx.globalAlpha = a; ctx.lineWidth = 1.4 * S;
+            ctx.beginPath(); ctx.roundRect(px0, ty, pw, pillH, pillH / 2);
+            if (solid) { ctx.fillStyle = rgba(pc, 0.95); ctx.fill(); }
+            else { ctx.fillStyle = rgba(pc, 0.10); ctx.fill(); ctx.strokeStyle = rgba(pc, dim ? 0.55 : 0.9); ctx.stroke(); }
+            ctx.globalAlpha = 1;
+            const tc = solid ? '#0a0f22' : rgba(pc, 1);
+            ctx.save(); ctx.shadowBlur = 0;
+            setFont(PILL); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.globalAlpha = a; ctx.fillStyle = tc;
+            ctx.fillText(lab, px0 + pw / 2 + 0.8 * S, ty + pillH / 2 + 0.5 * S);
+            ctx.restore(); if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+            wMax = pw; ty += pl.ph;
+          }
+          // name (+ ↗ after the last line when the project has a url)
+          const aw = arrowW(pl);
+          pl.mb.lines.forEach((l, j) => {
+            const last = j === pl.mb.lines.length - 1;
+            const x = side === 'L' && last ? lx - aw : lx;
+            const w = text(l, x, ty + j * pl.mb.lh, { ...pl.mb.o, base: 'top', alpha: a });
+            if (last && pl.url) text(' ↗', x + (side === 'L' ? 0 : w), ty + j * pl.mb.lh, { ...pl.mb.o, align: 'left', color: rgba(s.light, 1), weight: 600, base: 'top', alpha: a });
+            wMax = Math.max(wMax, w + (last ? aw : 0));
+          });
+          ty += pl.mb.h;
+          if (pl.sb) {
+            ty += 3 * S;
+            setFont(pl.sb.o); pl.sb.lines.forEach(l => { wMax = Math.max(wMax, ctx.measureText(l).width); });
+            if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+            ty += block(pl.sb, lx, ty, a);
+          }
+          if (pl.url && a > 0.5 && T.focus === si) {
+            const pad = 8 * S;
+            hits.push({ url: pl.url, x0: (side === 'L' ? lx - wMax : lx) - pad, x1: (side === 'L' ? lx : lx + wMax) + pad, y0: y0 - pad, y1: ty + pad });
+          }
+        });
+      }
+    });
+
+    // ---------- step indicator ----------
+    if (hud) {
+      const n = STEPS.length, sp = 13 * S, bx = W / 2 + 760 * S - (n - 1) * sp, by = H / 2 + 425 * S;
+      for (let i = 0; i < n; i++) {
+        ctx.globalAlpha = i === step ? 0.7 : 0.22; ctx.fillStyle = '#cfd6ec';
+        ctx.beginPath(); ctx.arc(bx + i * sp, by, (i === step ? 3.2 : 2.4) * S, 0, Math.PI * 2); ctx.fill();
+      }
+      if (auto) text(TXT.autoplayTag, bx - 14 * S, by + 4 * S, { size: 11, weight: 600, color: '#cfd6ec', align: 'right', spacing: 2, alpha: 0.4 });
+      ctx.globalAlpha = 1;
+    }
+    requestAnimationFrame(frame);
+  }
+  sprite.white = sprite([255, 245, 225], 0.1);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
